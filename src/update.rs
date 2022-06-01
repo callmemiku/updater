@@ -1,6 +1,10 @@
-use std::ptr::null;
-use serde_json::Value;
-use tokio_postgres::{Client, NoTls};
+use std::ops::Add;
+use std::time::Duration;
+use actix_web::web::{Json, Path};
+use serde_derive::{Serialize, Deserialize};
+use tokio_postgres::{Client, Config, NoTls};
+use crate::{errors::MyError};
+use actix_web::{Error, HttpResponse, HttpResponseBuilder};
 
 macro_rules! either {
     ($test:expr => $true_expr:expr; $false_expr:expr) => {
@@ -12,7 +16,7 @@ macro_rules! either {
         }
     }
 }
-
+pub const APPLICATION_JSON: &str = "application/json";
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateDTO {
     pub url: String,
@@ -28,9 +32,8 @@ pub struct UpdateDTO {
     pub pwd: String,
 }
 
-impl UpdateDTO {
-    pub fn new(message: String) -> Self {
-        let v: Value = serde_json::from_str(&message)?;
+/*impl UpdateDTO {
+    pub fn new(message: Json<UpdateDTO>) -> Self {
         Self {
             url: v["url"].to_string(),
             schema: v["schema"].to_string(),
@@ -45,33 +48,63 @@ impl UpdateDTO {
             pwd: v["pwd"].to_string()
         }
     }
+}*/
+#[get("/test")]
+pub async fn test() -> Result<HttpResponse, MyError> {
+    let config = format!("host={host} user={user} password={pw} dbname={db}", host = "localhost", db = "test", user = "postgres", pw = "postgres");
+    println!("{}", &config);
+    let (client, _connection) = Config::new()
+        .dbname("test")
+        .host("localhost")
+        .user("postgres")
+        .password("postgres")
+        .connect_timeout(Duration::new(5, 0))
+        .connect(NoTls)
+        .await
+        .unwrap();
+    println!("client da!");
+    let r = client.execute("SELECT * from parallel.core_person_address limit 5", &[]).await?;
+    println!("{}", r.to_string());
+    Ok(HttpResponse::Ok().json("200"))
 }
 
 #[post("/update")]
-pub async fn update(message: String) -> HttpResponse {
+pub async fn update(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
+    service(dto).await?;
+    Ok(HttpResponse::Ok()
+        .json("200"))
+}
+
+pub async fn service(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     let cpus = num_cpus::get() / 2;
-    let dto = UpdateDTO::new(message);
     let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
     let config = format!("host={host} user={user} password={pw} dbname={db}", host = &dto.host, db = &dto.db, user = &dto.usr, pw = &dto.pwd);
     let (client, connection) = tokio_postgres::connect(&*config, NoTls).await?;
-    tokio::spawn(async move || {
+    tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("conn err: {}", e)
         }
     });
-    let rows = client.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '$1' and IS_NULLABLE = 'NO'", &[&dto.table]).await?;
+    let keyQuery = client.prepare("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = $1 and IS_NULLABLE = 'NO';").await.unwrap();
+    let rows = client
+        .query(&keyQuery, &[&dto.table])
+        .await?;
     let key = rows[0].get(0);
-    createBackUp(&client, &bup, &dto.table, &key);
+    createBackUp(&client, &backup, &dto.table, &key).await?;
     for i in 1..cpus + 1 {
-        call(buildMainQuery(&dto, &key, &backup, cpus, i));
+        let str = buildMainQuery(&dto, &key, &backup, cpus, i);
+        call(&client, &str).await?;
     }
+    Ok(HttpResponse::Ok().json("200"))
 }
 
-async fn call(query: String) {
-    client.query(&query, &[]).await?;
+async fn call(client: &Client, query: &String) -> Result<HttpResponse, MyError> {
+    client.query(query, &[]).await?;
+    Ok(HttpResponse::Ok().json("200"))
 }
 
-async fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
+fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
+    let predicate = "AND ".to_string().add(&dto.predicate);
     format!("DO $do$
        DECLARE
            -- private variables (do not edit):
@@ -157,17 +190,19 @@ async fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usiz
             val = &dto.value,
             cpu_max = cpus,
             cpu_num = curr,
-            constr = either!(&dto.predicate.is_empty() => ""; "AND " + &dto.predicate),
+            constr = either!(dto.predicate.is_empty() => ""; &*predicate),
             host = &dto.host,
             db = &dto.db,
-            port = either!(&dto.port.is_empty() => "5432"; &dto.port),
+            port = either!(dto.port.is_empty() => "5432"; &dto.port),
             usr = &dto.usr,
             pwd = &dto.pwd)
 }
 
-fn createBackUp(client: &Client, bup: &String, table: &String, pkey: &String) {
+async fn createBackUp(client: &Client, bup: &String, table: &String, pkey: &String) -> Result<HttpResponse, MyError> {
+    let val: String = "".to_string().add(bup).add("_unique_id");
     client.query("VACUUM VERBOSE ANALYZE $1;", &[table]).await?;
     client.query("DROP TABLE IF EXISTS $1;", &[bup]).await?;
     client.query("create table if not exists $1 as (select * from $2);", &[bup, table]).await?;
-    client.query("CREATE UNIQUE INDEX $1 ON $2 ($3);", &[bup + "_unique_id", bup, pkey]).await?;
+    client.query("CREATE UNIQUE INDEX $1 ON $2 ($3);", &[&val, bup, pkey]).await?;
+    Ok(HttpResponse::Ok().json("ok"))
 }

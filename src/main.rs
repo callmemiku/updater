@@ -1,7 +1,12 @@
+#[macro_use]
+extern crate actix_web;
+extern crate env_logger;
+use std::{env, io};
+
+use actix_web::{middleware, App, HttpServer};
 mod update;
 mod test;
-
-use std::{env, io};
+mod errors;
 
 #[actix_rt::main]
 async fn main() -> io::Result<()> {
@@ -11,6 +16,7 @@ async fn main() -> io::Result<()> {
         App::new()
             .wrap(middleware::Logger::default())
             .service(update::update)
+            .service(update::test)
     })
         .bind("0.0.0.0:9090")?
         .run()
