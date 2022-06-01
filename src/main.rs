@@ -1,4 +1,5 @@
 mod update;
+mod test;
 
 use std::{env, io};
 
@@ -15,3 +16,7 @@ async fn main() -> io::Result<()> {
         .run()
         .await
 }
+
+/*fn main() {
+    test::main()
+}*/

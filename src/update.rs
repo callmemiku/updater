@@ -2,6 +2,17 @@ use std::ptr::null;
 use serde_json::Value;
 use tokio_postgres::{Client, NoTls};
 
+macro_rules! either {
+    ($test:expr => $true_expr:expr; $false_expr:expr) => {
+        if $test {
+            $true_expr
+        }
+        else {
+            $false_expr
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateDTO {
     pub schema: String,
@@ -32,11 +43,11 @@ impl UpdateDTO {
 
 #[post("/update")]
 pub async fn update(message: String) -> HttpResponse {
-
+    let cpus = num_cpus::get() / 2;
     let dto = UpdateDTO::new(message);
-    let backup: String = ("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
-    let config = ("host={host} user={user} password={pw}", host = &dto.host, user = &dto.usr, pw = &dto.pwd);
-    let (client, connection) = tokio_postgres::connect(*config, NoTls).await?;
+    let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
+    let config = format!("host={host} user={user} password={pw}", host = &dto.host, user = &dto.usr, pw = &dto.pwd);
+    let (client, connection) = tokio_postgres::connect(&*config, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("conn err: {}", e)
@@ -45,13 +56,15 @@ pub async fn update(message: String) -> HttpResponse {
 
     let rows = client.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '$1' and IS_NULLABLE = 'NO'", &[&dto.table]).await?;
     let key = rows[0].get(0);
-
-    let query = buildMainQuery(dto, &key, &backup);
-
+    createBackUp(&client, &bup, &dto.table, &key);
+    for i in 1..cpus + 1 {
+        let query = buildMainQuery(&dto, &key, &backup, cpus, i);
+        client.query(&query, &[]).await?;
+    }
 }
 
-fn buildMainQuery(dto: UpdateDTO, pkey: &String, bup: &String) -> String {
-    *("DO $do$
+fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
+    format!("DO $do$
        DECLARE
            -- private variables (do not edit):
                 total_time_start timestamp default clock_timestamp();
@@ -70,8 +83,8 @@ fn buildMainQuery(dto: UpdateDTO, pkey: &String, bup: &String) -> String {
                 -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
                 cur CURSOR FOR SELECT * FROM {backup_table} ORDER BY {key}; -- здесь д.б. именно временная таблица, сортировка по id обязательна!
                 time_max constant numeric default 1; -- пороговое максимальное время выполнения 1-го запроса, в секундах (рекомендуется 1 секунда)
-                cpu_num constant smallint default 1; -- для распараллеливания скрипта для выполнения через {JiraTaskId}_do.sh: номер текущего ядра процессора
-                cpu_max constant smallint default 1; -- для распараллеливания скрипта для выполнения через {JiraTaskId}_do.sh: максимальное количество ядер процессора
+                cpu_num constant smallint default 1;
+                cpu_max constant smallint default 1;
        BEGIN
            RAISE NOTICE 'Calculate total rows%', ' ';
 
@@ -99,6 +112,7 @@ fn buildMainQuery(dto: UpdateDTO, pkey: &String, bup: &String) -> String {
                         WHERE n.{key} % ' || '{cpu_max} || ' = (' || {cpu_num} || ' - 1)
                         AND t.{key} = n.{key} AND t.{key} BETWEEN ' ||
                                             rec_start.{key} || ' AND ' || rec_stop.{key}
+                            {constr}
                             );
 
                         query_time_elapsed := round(extract('epoch' from clock_timestamp() - query_time_start)::numeric, 2);
@@ -126,11 +140,21 @@ fn buildMainQuery(dto: UpdateDTO, pkey: &String, bup: &String) -> String {
                 RAISE NOTICE 'Done. % rows per second, % queries per second', (processed_rows / total_time_elapsed)::int, round(cycles / total_time_elapsed, 2);
 
             END
-    $do$ language plpgsql;", table = &dto.table, backup_table = bup, key = pkey, val = &dto.value)
+    $do$ language plpgsql;",
+            schema = &dto.schema,
+            field = &dto.field,
+            table = &dto.table,
+            backup_table = bup,
+            key = pkey,
+            val = &dto.value,
+            cpu_max = cpus,
+            cpu_num = curr,
+            constr = either!(&dto.predicate.is_empty() => ""; "AND " + &dto.predicate))
 }
 
 fn createBackUp(client: &Client, bup: &String, table: &String, pkey: &String) {
+    client.query("VACUUM VERBOSE ANALYZE $1;", &[table]).await?;
     client.query("DROP TABLE IF EXISTS $1;", &[bup]).await?;
     client.query("create table if not exists $1 as (select * from $2);", &[bup, table]).await?;
-
+    client.query("CREATE UNIQUE INDEX $1 ON $2 ($3);", &[bup + "_unique_id", bup, pkey]).await?;
 }
