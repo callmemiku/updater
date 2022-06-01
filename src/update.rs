@@ -15,12 +15,15 @@ macro_rules! either {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateDTO {
+    pub url: String,
     pub schema: String,
     pub table: String,
     pub field: String,
     pub value: String,
     pub predicate: String,
     pub host: String,
+    pub db: String,
+    pub port: String,
     pub usr: String,
     pub pwd: String,
 }
@@ -29,12 +32,15 @@ impl UpdateDTO {
     pub fn new(message: String) -> Self {
         let v: Value = serde_json::from_str(&message)?;
         Self {
+            url: v["url"].to_string(),
             schema: v["schema"].to_string(),
             table: v["table"].to_string(),
             field: v["field"].to_string(),
             value: v["value"].to_string(),
             predicate: v["predicate"].to_string(),
             host: v["url"].to_string(),
+            db: v["db"].to_string(),
+            port: v["port"].to_string(),
             usr: v["usr"].to_string(),
             pwd: v["pwd"].to_string()
         }
@@ -46,24 +52,26 @@ pub async fn update(message: String) -> HttpResponse {
     let cpus = num_cpus::get() / 2;
     let dto = UpdateDTO::new(message);
     let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
-    let config = format!("host={host} user={user} password={pw}", host = &dto.host, user = &dto.usr, pw = &dto.pwd);
+    let config = format!("host={host} user={user} password={pw} dbname={db}", host = &dto.host, db = &dto.db, user = &dto.usr, pw = &dto.pwd);
     let (client, connection) = tokio_postgres::connect(&*config, NoTls).await?;
-    tokio::spawn(async move {
+    tokio::spawn(async move || {
         if let Err(e) = connection.await {
             eprintln!("conn err: {}", e)
         }
     });
-
     let rows = client.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '$1' and IS_NULLABLE = 'NO'", &[&dto.table]).await?;
     let key = rows[0].get(0);
     createBackUp(&client, &bup, &dto.table, &key);
     for i in 1..cpus + 1 {
-        let query = buildMainQuery(&dto, &key, &backup, cpus, i);
-        client.query(&query, &[]).await?;
+        call(buildMainQuery(&dto, &key, &backup, cpus, i));
     }
 }
 
-fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
+async fn call(query: String) {
+    client.query(&query, &[]).await?;
+}
+
+async fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
     format!("DO $do$
        DECLARE
            -- private variables (do not edit):
@@ -91,7 +99,7 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, cur
                 -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
                 SELECT COUNT(*) INTO total_rows FROM {backup_table};
 
-                PERFORM dblink_connect('host=localhost port=5432 dbname=work_pc user=postgres password=root');
+                PERFORM dblink_connect('host={host} port={port} dbname={db} user={usr} password={pwd}');
 
                 FOR rec_start IN cur LOOP
                         cycles := cycles + 1;
@@ -107,7 +115,7 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, cur
 
                         PERFORM dblink_exec('
                         update {schema}.{table} n
-                               set {field} = {val}, modify_dttm = now()
+                               set {field} = {val} as value, modify_dttm = now()
                         FROM {schema}.{backup_table} as t
                         WHERE n.{key} % ' || '{cpu_max} || ' = (' || {cpu_num} || ' - 1)
                         AND t.{key} = n.{key} AND t.{key} BETWEEN ' ||
@@ -149,7 +157,12 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, cur
             val = &dto.value,
             cpu_max = cpus,
             cpu_num = curr,
-            constr = either!(&dto.predicate.is_empty() => ""; "AND " + &dto.predicate))
+            constr = either!(&dto.predicate.is_empty() => ""; "AND " + &dto.predicate),
+            host = &dto.host,
+            db = &dto.db,
+            port = either!(&dto.port.is_empty() => "5432"; &dto.port),
+            usr = &dto.usr,
+            pwd = &dto.pwd)
 }
 
 fn createBackUp(client: &Client, bup: &String, table: &String, pkey: &String) {

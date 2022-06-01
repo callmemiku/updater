@@ -10,7 +10,7 @@ async fn main() -> io::Result<()> {
     HttpServer::new(|| {
         App::new()
             .wrap(middleware::Logger::default())
-            .service(update)
+            .service(update::update)
     })
         .bind("0.0.0.0:9090")?
         .run()
