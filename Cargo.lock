@@ -984,28 +984,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
-name = "learning-rust"
-version = "0.1.0"
-dependencies = [
- "actix-rt",
- "actix-web",
- "async-std",
- "chrono",
- "deadpool-postgres",
- "derive_more",
- "env_logger",
- "futures 0.3.21",
- "futures-cpupool",
- "num_cpus",
- "serde",
- "serde_derive",
- "serde_json",
- "tokio",
- "tokio-pg-mapper",
- "tokio-postgres",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1668,6 +1646,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d54590932941a9e9266f0832deed84ebe1bf2e4c9e4a3554d393d18f5e854bf9"
 dependencies = [
  "tinyvec",
+]
+
+[[package]]
+name = "updater-rust"
+version = "1.0.0"
+dependencies = [
+ "actix-rt",
+ "actix-web",
+ "async-std",
+ "chrono",
+ "deadpool-postgres",
+ "derive_more",
+ "env_logger",
+ "futures 0.3.21",
+ "futures-cpupool",
+ "num_cpus",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "tokio-pg-mapper",
+ "tokio-postgres",
 ]
 
 [[package]]
