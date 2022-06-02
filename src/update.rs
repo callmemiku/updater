@@ -51,30 +51,34 @@ pub async fn batches(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
         .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
         .await.unwrap();
     let key: String = rows[0].get(0);
+    println!("Found primary key - {k}", k = key);
     createBackUp(&client, &backup, &dto, &key).await.unwrap();
     println!("pre-works done!");
-    let idsq = format!("select {akey} from {tab} order by {akey}", akey = key, tab = &dto.schema.to_string().add(".").add(&dto.table));
+    let idsq = format!("select {akey}::bigint from {tab} order by {akey}::bigint ",
+                       akey = key,
+                       tab = &dto.schema.to_string().add(".").add(&dto.table));
     let rows = client.query(&idsq, &[]).await.unwrap();
+    println!("Found {k} rows!", k = rows.len());
     let threshold = rows.len() / cpus;
     let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
     client.execute(&start_notice, &[]).await.unwrap();
     for i in 0..cpus {
-        let min: i32 = rows[i * threshold].get(0);
+        let min: i64 = rows[i * threshold].get(0);
         let max_index = either!(i == cpus - 1 => rows.len() - 1;(i + 1) * threshold);
-        let max: i32 = rows[max_index].get(0);
+        let max: i64 = rows[max_index].get(0);
         let query = batch(min, max, &dto, &key).await;
         println!("{}", query);
-        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query));
+        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query, ));
     }
     let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
     client.execute(&end_notice, &[]).await.unwrap();
     Ok(HttpResponse::Ok().json("200"))
 }
 
-async fn batch(min: i32, max: i32, dto: &UpdateDTO, key: &String) -> String {
+async fn batch(min: i64, max: i64, dto: &UpdateDTO, key: &String) -> String {
     let predicate = "AND ".to_string().add(&dto.predicate);
     format!("update {schema}.{table} set {field} = '{val}', modify_dttm = now()
-                        WHERE {pkey} between {minid} and {maxid} {constr}",
+                        WHERE {pkey}::numeric between {minid} and {maxid} {constr}",
         schema = &dto.schema,
         table = &dto.table,
         minid = min,
@@ -110,9 +114,8 @@ pub async fn service(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
         .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
         .await.unwrap();
     let key: String = rows[0].get(0);
-    //createBackUp(&client, &backup, &dto, &key).await.unwrap();
+    createBackUp(&client, &backup, &dto, &key).await.unwrap();
     println!("after backup!");
-    let idsq = format!("select {akey} from {tab} order by {akey}", akey = key, tab = &dto.schema.to_string().add(".").add(&dto.table));
     for i in 1..cpus + 1 {
         let query = buildMainQuery(&dto, &key, &backup, cpus.to_string(), i.to_string());
         tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query));
@@ -127,6 +130,11 @@ async fn call(client: Object, query: &String) -> Result<HttpResponse, MyError> {
 }
 
 async fn call_parallel(client: Object, query: String) {
+    client.execute(&query, &[]).await.unwrap();
+    println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
+}
+
+async fn call_parallel_batch(client: Object, query: String, ids: Vec<i64>) {
     client.execute(&query, &[]).await.unwrap();
     println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
 }
@@ -150,7 +158,7 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, cu
 
         -- public variables (need to edit):
         -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
-        cur CURSOR FOR SELECT * FROM {schema}.{backup_table} ORDER BY {key}; -- здесь д.б. именно временная таблица, сортировка по id обязательна!
+        cur CURSOR FOR SELECT * FROM {schema}.{backup_table} ORDER BY {key}::numeric; -- здесь д.б. именно временная таблица, сортировка по id обязательна!
         time_max constant numeric default 1; -- пороговое максимальное время выполнения 1-го запроса, в секундах (рекомендуется 1 секунда)
         cpu_num constant smallint default 1;
         cpu_max constant smallint default 1;
@@ -175,9 +183,9 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, cu
                 query_time_start := clock_timestamp();
 
                 PERFORM dblink_exec('
-                        update {schema}.{table} n
-                        set {field} = '' {val} '', modify_dttm = now() FROM {schema}.{backup_table} as t
-                        WHERE n.{key} % ' || {cpu_max} || ' = (' || {cpu_num} || ' - 1) AND t.{key} = n.{key} AND t.{key} BETWEEN ' || rec_start.{key} || ' AND ' || rec_stop.{key} {constr});
+                        update {schema}.{table} as n
+                        set {field} = ''{val}'', modify_dttm = now() FROM {schema}.{backup_table} as t
+                        WHERE n.{key}::numeric % ' || {cpu_max} || ' = (' || {cpu_num} || ' - 1) AND t.{key}::numeric = n.{key}::numeric AND t.{key}::numeric BETWEEN ' || rec_start.{key}::numeric || ' AND ' || rec_stop.{key}::numeric {constr});
                         query_time_elapsed := round(extract('epoch' from clock_timestamp() - query_time_start)::numeric, 2);
                         total_time_elapsed := round(extract('epoch' from clock_timestamp() - total_time_start)::numeric, 2);
                         processed_rows := processed_rows + batch_rows;
@@ -228,15 +236,60 @@ async fn createBackUp(client: &Object, backup: &String, dto: &UpdateDTO, pkey: &
 
     let vacuum = format!("vacuum verbose analyse {tab}", tab = table);
     client.query(&vacuum, &[]).await.unwrap();
-
-    /*let drop = format!("DROP TABLE IF EXISTS {}", backup);
+    println!("Vacuumed.");
+    let drop = format!("DROP TABLE IF EXISTS {}", backup);
     client.query(&drop, &[]).await.unwrap();
-
+    println!("Dropped backup if exist.");
     let create = format!("create table if not exists {} as (select * from {})", backup, table);
     client.query(&create, &[]).await.unwrap();
-
-    let index = format!("CREATE UNIQUE INDEX {} ON {} ({})", val, backup, pkey);
-    client.query(&index, &[]).await.unwrap();*/
-
+    println!("Created backup.");
+    let index = format!("CREATE INDEX {} ON {} (({}::numeric))", val, backup, pkey);
+    client.query(&index, &[]).await.unwrap();
+    println!("Index added.");
     Ok(HttpResponse::Ok().json("ok"))
+}
+
+
+#[post("/batches-selective")]
+pub async fn batches_selective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
+    let cpus = num_cpus::get() / 2;
+    let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
+    let mut cfg = Config::new();
+    cfg.host = Some(dto.host.to_string());
+    cfg.user = Some(dto.usr.to_string());
+    cfg.password = Some(dto.pwd.to_string());
+    cfg.port = Some(5432);
+    cfg.application_name = Some("RUST TUT".to_string());
+    cfg.dbname = Some(dto.db.to_string());
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
+        .await.unwrap();
+    let key: String = rows[0].get(0);
+    println!("Found primary key - {k}", k = key);
+    createBackUp(&client, &backup, &dto, &key).await.unwrap();
+    println!("pre-works done!");
+    let predicate = "where ".to_string().add(&dto.predicate);
+    let idsq = format!("select {akey}::bigint from {tab} {con} order by {akey}::bigint ",
+                       akey = key,
+                       tab = &dto.schema.to_string().add(".").add(&dto.table),
+                       con = either!(dto.predicate.is_empty() => ""; &*predicate));
+    let rows = client.query(&idsq, &[]).await.unwrap();
+    println!("Found {k} rows!", k = rows.len());
+    let threshold = rows.len() / cpus;
+    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&start_notice, &[]).await.unwrap();
+    for i in 0..cpus {
+        let min: i64 = rows[i * threshold].get(0);
+        let max_index = either!(i == cpus - 1 => rows.len() - 1;(i + 1) * threshold);
+        let max: i64 = rows[max_index].get(0);
+        let query = batch(min, max, &dto, &key).await;
+        println!("{}", query);
+        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query, ));
+    }
+    let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&end_notice, &[]).await.unwrap();
+    Ok(HttpResponse::Ok().json("200"))
 }

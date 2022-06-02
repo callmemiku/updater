@@ -1649,8 +1649,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "updater-rust"
-version = "1.0.0"
+name = "updater"
+version = "1.1.0"
 dependencies = [
  "actix-rt",
  "actix-web",
