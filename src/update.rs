@@ -1,10 +1,18 @@
-use std::ops::Add;
-use std::time::Duration;
-use actix_web::web::{Json, Path};
-use serde_derive::{Serialize, Deserialize};
-use tokio_postgres::{Client, Config, NoTls};
-use crate::{errors::MyError};
-use actix_web::{Error, HttpResponse, HttpResponseBuilder};
+use std::ops::{Add, Deref};
+use std::time::SystemTime;
+use futures::future::join_all;
+use futures::executor::ThreadPool;
+use actix_web::web::{Json};
+use actix_web::{HttpResponse};
+use actix_web::dev::Service;
+use actix_web::error::Error;
+use chrono::Local;
+use deadpool_postgres::{Config, ManagerConfig, Object, RecyclingMethod, Runtime};
+use deadpool_postgres::tokio_postgres::{ NoTls};
+use futures::{Future};
+use futures_cpupool::CpuPool;
+use crate::errors::MyError;
+use crate::models::UpdateDTO;
 
 macro_rules! either {
     ($test:expr => $true_expr:expr; $false_expr:expr) => {
@@ -16,146 +24,160 @@ macro_rules! either {
         }
     }
 }
+
 pub const APPLICATION_JSON: &str = "application/json";
-#[derive(Debug, Deserialize, Serialize)]
-pub struct UpdateDTO {
-    pub url: String,
-    pub schema: String,
-    pub table: String,
-    pub field: String,
-    pub value: String,
-    pub predicate: String,
-    pub host: String,
-    pub db: String,
-    pub port: String,
-    pub usr: String,
-    pub pwd: String,
+
+#[get("/test")]
+pub async fn test() -> Result<HttpResponse, Error> {
+    println!("{}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    Ok(HttpResponse::Ok().json("200"))
 }
 
-/*impl UpdateDTO {
-    pub fn new(message: Json<UpdateDTO>) -> Self {
-        Self {
-            url: v["url"].to_string(),
-            schema: v["schema"].to_string(),
-            table: v["table"].to_string(),
-            field: v["field"].to_string(),
-            value: v["value"].to_string(),
-            predicate: v["predicate"].to_string(),
-            host: v["url"].to_string(),
-            db: v["db"].to_string(),
-            port: v["port"].to_string(),
-            usr: v["usr"].to_string(),
-            pwd: v["pwd"].to_string()
-        }
+#[post("/batches")]
+pub async fn batches(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
+    let cpus = num_cpus::get() / 2;
+    let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
+    let mut cfg = Config::new();
+    cfg.host = Some(dto.host.to_string());
+    cfg.user = Some(dto.usr.to_string());
+    cfg.password = Some(dto.pwd.to_string());
+    cfg.port = Some(5432);
+    cfg.application_name = Some("RUST TUT".to_string());
+    cfg.dbname = Some(dto.db.to_string());
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
+        .await.unwrap();
+    let key: String = rows[0].get(0);
+    createBackUp(&client, &backup, &dto, &key).await.unwrap();
+    println!("pre-works done!");
+    let idsq = format!("select {akey} from {tab} order by {akey}", akey = key, tab = &dto.schema.to_string().add(".").add(&dto.table));
+    let rows = client.query(&idsq, &[]).await.unwrap();
+    let threshold = rows.len() / cpus;
+    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&start_notice, &[]).await.unwrap();
+    for i in 0..cpus {
+        let min: i32 = rows[i * threshold].get(0);
+        let max_index = either!(i == cpus - 1 => rows.len() - 1;(i + 1) * threshold);
+        let max: i32 = rows[max_index].get(0);
+        let query = batch(min, max, &dto, &key).await;
+        println!("{}", query);
+        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query));
     }
-}*/
-#[get("/test")]
-pub async fn test() -> Result<HttpResponse, MyError> {
-    let config = format!("host={host} user={user} password={pw} dbname={db}", host = "localhost", db = "test", user = "postgres", pw = "postgres");
-    println!("{}", &config);
-    let (client, _connection) = Config::new()
-        .dbname("test")
-        .host("localhost")
-        .user("postgres")
-        .password("postgres")
-        .connect_timeout(Duration::new(5, 0))
-        .connect(NoTls)
-        .await
-        .unwrap();
-    println!("client da!");
-    let r = client.execute("SELECT * from parallel.core_person_address limit 5", &[]).await?;
-    println!("{}", r.to_string());
+    let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&end_notice, &[]).await.unwrap();
     Ok(HttpResponse::Ok().json("200"))
+}
+
+async fn batch(min: i32, max: i32, dto: &UpdateDTO, key: &String) -> String {
+    let predicate = "AND ".to_string().add(&dto.predicate);
+    format!("update {schema}.{table} set {field} = '{val}', modify_dttm = now()
+                        WHERE {pkey} between {minid} and {maxid} {constr}",
+        schema = &dto.schema,
+        table = &dto.table,
+        minid = min,
+        maxid = max,
+        pkey = key,
+        constr = either!(dto.predicate.is_empty() => ""; &*predicate),
+        field = &dto.field,
+        val = &dto.value
+    )
 }
 
 #[post("/update")]
 pub async fn update(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     service(dto).await?;
-    Ok(HttpResponse::Ok()
-        .json("200"))
+    Ok(HttpResponse::Ok().json("200"))
 }
 
 pub async fn service(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     let cpus = num_cpus::get() / 2;
     let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
-    let config = format!("host={host} user={user} password={pw} dbname={db}", host = &dto.host, db = &dto.db, user = &dto.usr, pw = &dto.pwd);
-    let (client, connection) = tokio_postgres::connect(&*config, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("conn err: {}", e)
-        }
-    });
-    let keyQuery = client.prepare("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = $1 and IS_NULLABLE = 'NO';").await.unwrap();
+    let mut cfg = Config::new();
+    println!("{} {} {} {}", dto.host.to_string(), dto.usr.to_string(), dto.pwd.to_string(), dto.db.to_string());
+    cfg.host = Some(dto.host.to_string());
+    cfg.user = Some(dto.usr.to_string());
+    cfg.password = Some(dto.pwd.to_string());
+    cfg.port = Some(5432);
+    cfg.application_name = Some("RUST TUT".to_string());
+    cfg.dbname = Some(dto.db.to_string());
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+    let client = pool.get().await.unwrap();
     let rows = client
-        .query(&keyQuery, &[&dto.table])
-        .await?;
-    let key = rows[0].get(0);
-    createBackUp(&client, &backup, &dto.table, &key).await?;
+        .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
+        .await.unwrap();
+    let key: String = rows[0].get(0);
+    //createBackUp(&client, &backup, &dto, &key).await.unwrap();
+    println!("after backup!");
+    let idsq = format!("select {akey} from {tab} order by {akey}", akey = key, tab = &dto.schema.to_string().add(".").add(&dto.table));
     for i in 1..cpus + 1 {
-        let str = buildMainQuery(&dto, &key, &backup, cpus, i);
-        call(&client, &str).await?;
+        let query = buildMainQuery(&dto, &key, &backup, cpus.to_string(), i.to_string());
+        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query));
+        //call(&client, &query).await.unwrap();
     }
     Ok(HttpResponse::Ok().json("200"))
 }
 
-async fn call(client: &Client, query: &String) -> Result<HttpResponse, MyError> {
-    client.query(query, &[]).await?;
+async fn call(client: Object, query: &String) -> Result<HttpResponse, MyError> {
+    client.execute(query, &[]).await.unwrap();
     Ok(HttpResponse::Ok().json("200"))
 }
 
-fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, curr: usize) -> String {
+async fn call_parallel(client: Object, query: String) {
+    client.execute(&query, &[]).await.unwrap();
+    println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
+}
+
+fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, curr: String) -> String {
     let predicate = "AND ".to_string().add(&dto.predicate);
     format!("DO $do$
-       DECLARE
-           -- private variables (do not edit):
-                total_time_start timestamp default clock_timestamp();
-                total_time_elapsed numeric default 0; -- время выполнения всех запросов, в секундах
-                query_time_start timestamp;
-                query_time_elapsed numeric default 0; -- фактическое время выполнения 1-го запроса, в секундах
-                estimated_time interval default null; -- оценочное время, сколько осталось работать
-                rec_start record;
-                rec_stop record;
-                cycles int default 0; -- счётчик для цикла
-                batch_rows int default 1; -- по сколько записей будем обновлять за 1 цикл
-                processed_rows int default 0; -- счётчик, сколько записей обновили, увеличивается на каждой итерации цикла
-                total_rows int default 0; -- количество записей всего
+    DECLARE
+        -- private variables (do not edit):
+        total_time_start timestamp default clock_timestamp();
+        total_time_elapsed numeric default 0; -- время выполнения всех запросов, в секундах
+        query_time_start timestamp;
+        query_time_elapsed numeric default 0; -- фактическое время выполнения 1-го запроса, в секундах
+        estimated_time interval default null; -- оценочное время, сколько осталось работать
+        rec_start record;
+        rec_stop record;
+        cycles int default 0; -- счётчик для цикла
+        batch_rows int default 1; -- по сколько записей будем обновлять за 1 цикл
+        processed_rows int default 0; -- счётчик, сколько записей обновили, увеличивается на каждой итерации цикла
+        total_rows int default 0; -- количество записей всего
 
-                -- public variables (need to edit):
-                -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
-                cur CURSOR FOR SELECT * FROM {backup_table} ORDER BY {key}; -- здесь д.б. именно временная таблица, сортировка по id обязательна!
-                time_max constant numeric default 1; -- пороговое максимальное время выполнения 1-го запроса, в секундах (рекомендуется 1 секунда)
-                cpu_num constant smallint default 1;
-                cpu_max constant smallint default 1;
-       BEGIN
-           RAISE NOTICE 'Calculate total rows%', ' ';
+        -- public variables (need to edit):
+        -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
+        cur CURSOR FOR SELECT * FROM {schema}.{backup_table} ORDER BY {key}; -- здесь д.б. именно временная таблица, сортировка по id обязательна!
+        time_max constant numeric default 1; -- пороговое максимальное время выполнения 1-го запроса, в секундах (рекомендуется 1 секунда)
+        cpu_num constant smallint default 1;
+        cpu_max constant smallint default 1;
+    BEGIN
+        RAISE NOTICE 'Calculate total rows%', ' ';
 
-                -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
-                SELECT COUNT(*) INTO total_rows FROM {backup_table};
+        -- в этом запросе нужно исправить только название временной таблицы, остальное не трогать!
+        SELECT COUNT(*) INTO total_rows FROM {schema}.{backup_table};
 
-                PERFORM dblink_connect('host={host} port={port} dbname={db} user={usr} password={pwd}');
+        PERFORM dblink_connect('host={host} port={port} dbname={db} user={usr} password={pwd}');
 
-                FOR rec_start IN cur LOOP
-                        cycles := cycles + 1;
+        FOR rec_start IN cur LOOP
+                cycles := cycles + 1;
 
-                        FETCH RELATIVE (batch_rows - 1) FROM cur INTO rec_stop;
+                FETCH RELATIVE (batch_rows - 1) FROM cur INTO rec_stop;
 
-                        IF rec_stop IS NULL THEN
-                            batch_rows := total_rows - processed_rows;
-                            FETCH LAST FROM cur INTO rec_stop;
-                        END IF;
+                IF rec_stop IS NULL THEN
+                    batch_rows := total_rows - processed_rows;
+                    FETCH LAST FROM cur INTO rec_stop;
+                END IF;
 
-                        query_time_start := clock_timestamp();
+                query_time_start := clock_timestamp();
 
-                        PERFORM dblink_exec('
+                PERFORM dblink_exec('
                         update {schema}.{table} n
-                               set {field} = {val} as value, modify_dttm = now()
-                        FROM {schema}.{backup_table} as t
-                        WHERE n.{key} % ' || '{cpu_max} || ' = (' || {cpu_num} || ' - 1)
-                        AND t.{key} = n.{key} AND t.{key} BETWEEN ' ||
-                                            rec_start.{key} || ' AND ' || rec_stop.{key}
-                            {constr}
-                            );
-
+                        set {field} = '' {val} '', modify_dttm = now() FROM {schema}.{backup_table} as t
+                        WHERE n.{key} % ' || {cpu_max} || ' = (' || {cpu_num} || ' - 1) AND t.{key} = n.{key} AND t.{key} BETWEEN ' || rec_start.{key} || ' AND ' || rec_stop.{key} {constr});
                         query_time_elapsed := round(extract('epoch' from clock_timestamp() - query_time_start)::numeric, 2);
                         total_time_elapsed := round(extract('epoch' from clock_timestamp() - total_time_start)::numeric, 2);
                         processed_rows := processed_rows + batch_rows;
@@ -198,11 +220,23 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: usize, cur
             pwd = &dto.pwd)
 }
 
-async fn createBackUp(client: &Client, bup: &String, table: &String, pkey: &String) -> Result<HttpResponse, MyError> {
-    let val: String = "".to_string().add(bup).add("_unique_id");
-    client.query("VACUUM VERBOSE ANALYZE $1;", &[table]).await?;
-    client.query("DROP TABLE IF EXISTS $1;", &[bup]).await?;
-    client.query("create table if not exists $1 as (select * from $2);", &[bup, table]).await?;
-    client.query("CREATE UNIQUE INDEX $1 ON $2 ($3);", &[&val, bup, pkey]).await?;
+async fn createBackUp(client: &Object, backup: &String, dto: &UpdateDTO, pkey: &String) -> Result<HttpResponse, MyError> {
+
+    let val: String = backup.to_string().add("_unique_id");
+    let table = &dto.schema.to_string().add(".").add(&dto.table);
+    let backup = &dto.schema.to_string().add(".").add(backup);
+
+    let vacuum = format!("vacuum verbose analyse {tab}", tab = table);
+    client.query(&vacuum, &[]).await.unwrap();
+
+    /*let drop = format!("DROP TABLE IF EXISTS {}", backup);
+    client.query(&drop, &[]).await.unwrap();
+
+    let create = format!("create table if not exists {} as (select * from {})", backup, table);
+    client.query(&create, &[]).await.unwrap();
+
+    let index = format!("CREATE UNIQUE INDEX {} ON {} ({})", val, backup, pkey);
+    client.query(&index, &[]).await.unwrap();*/
+
     Ok(HttpResponse::Ok().json("ok"))
 }
