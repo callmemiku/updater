@@ -6,7 +6,7 @@ use actix_web::web::{Json};
 use actix_web::{HttpResponse};
 use actix_web::dev::Service;
 use actix_web::error::Error;
-use chrono::Local;
+use chrono::{DateTime, Duration, Local};
 use deadpool_postgres::{Config, ManagerConfig, Object, RecyclingMethod, Runtime};
 use deadpool_postgres::tokio_postgres::{ NoTls};
 use futures::{Future};
@@ -134,10 +134,7 @@ async fn call_parallel(client: Object, query: String) {
     println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
 }
 
-async fn call_parallel_batch(client: Object, query: String, ids: Vec<i64>) {
-    client.execute(&query, &[]).await.unwrap();
-    println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
-}
+
 
 fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, curr: String) -> String {
     let predicate = "AND ".to_string().add(&dto.predicate);
@@ -279,17 +276,28 @@ pub async fn batches_selective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyE
     let rows = client.query(&idsq, &[]).await.unwrap();
     println!("Found {k} rows!", k = rows.len());
     let threshold = rows.len() / cpus;
-    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    let start = Local::now();
+    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = start.format("%Y-%m-%d %H:%M:%S"));
     client.execute(&start_notice, &[]).await.unwrap();
-    for i in 0..cpus {
-        let min: i64 = rows[i * threshold].get(0);
-        let max_index = either!(i == cpus - 1 => rows.len() - 1;(i + 1) * threshold);
-        let max: i64 = rows[max_index].get(0);
-        let query = batch(min, max, &dto, &key).await;
-        println!("{}", query);
-        tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query, ));
+    let threads = either!(rows.len() / 60000 > cpus => cpus; rows.len() / 60000 + 1);
+    for i in 0..threads {
+        let min: i64 = (i * threshold) as i64;
+        let max = either!(i == cpus - 1 => rows.len() - 1; (i + 1) * threshold);
+        let mut ids: Vec<i64> = vec![];
+        (min..max as i64).map(|n| {
+            let mut index = 0;
+            ids.insert(index, rows[n as usize].get(0));
+            index = index + 1;
+        });
+        tokio::task::spawn(call_parallel_batch(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), ids, i, cpus, start));
     }
     let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
     client.execute(&end_notice, &[]).await.unwrap();
     Ok(HttpResponse::Ok().json("200"))
+}
+
+async fn call_parallel_batch(client: Object, ids: Vec<i64>, number: usize, total: usize, start: DateTime<Local>){
+    client.execute(&query, &[]).await.unwrap();
+    let dur = Local::now().signed_duration_since(start).to_std().unwrap().as_secs();
+    println!("Done {num} / {tot}, time elapsed: {time} seconds!", tot = total, num = number, time = dur);
 }
