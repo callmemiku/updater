@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+use std::iter::Map;
 use std::ops::{Add, Deref};
 use std::time::SystemTime;
 use futures::future::join_all;
@@ -11,8 +13,10 @@ use deadpool_postgres::{Config, ManagerConfig, Object, RecyclingMethod, Runtime}
 use deadpool_postgres::tokio_postgres::{ NoTls};
 use futures::{Future};
 use futures_cpupool::CpuPool;
+use substring::Substring;
 use crate::errors::MyError;
 use crate::models::UpdateDTO;
+
 
 macro_rules! either {
     ($test:expr => $true_expr:expr; $false_expr:expr) => {
@@ -25,6 +29,7 @@ macro_rules! either {
     }
 }
 
+const BATCH_SIZE: usize = 60000;
 pub const APPLICATION_JSON: &str = "application/json";
 
 #[get("/test")]
@@ -33,6 +38,7 @@ pub async fn test() -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Ok().json("200"))
 }
 
+#[deprecated(since="1.3.0", note="please use `batches_selective` instead")]
 #[post("/batches")]
 pub async fn batches(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     let cpus = num_cpus::get() / 2;
@@ -269,35 +275,78 @@ pub async fn batches_selective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyE
     createBackUp(&client, &backup, &dto, &key).await.unwrap();
     println!("pre-works done!");
     let predicate = "where ".to_string().add(&dto.predicate);
-    let idsq = format!("select {akey}::bigint from {tab} {con} order by {akey}::bigint ",
-                       akey = key,
+    let count_query = format!("select COUNT(*)::bigint from {tab} {con}",
                        tab = &dto.schema.to_string().add(".").add(&dto.table),
                        con = either!(dto.predicate.is_empty() => ""; &*predicate));
-    let rows = client.query(&idsq, &[]).await.unwrap();
-    println!("Found {k} rows!", k = rows.len());
-    let threshold = rows.len() / cpus;
+    let count = client.query(&count_query, &[]).await.unwrap();
+    println!("Found {k} rows!", k = count.len());
     let start = Local::now();
     let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = start.format("%Y-%m-%d %H:%M:%S"));
     client.execute(&start_notice, &[]).await.unwrap();
-    let threads = either!(rows.len() / 60000 > cpus => cpus; rows.len() / 60000 + 1);
-    for i in 0..threads {
-        let min: i64 = (i * threshold) as i64;
-        let max = either!(i == cpus - 1 => rows.len() - 1; (i + 1) * threshold);
-        let mut ids: Vec<i64> = vec![];
-        (min..max as i64).map(|n| {
+    let threshold = rows.len() / cpus;
+    let threads = either!(rows.len() / BATCH_SIZE > cpus => cpus; rows.len() / BATCH_SIZE + 1);
+    let mut sum = 0;
+    let idsq = format!("select {akey}::bigint from {tab} {con} order by {akey}::bigint offset {offset} limit {limit}",
+                       akey = key,
+                       tab = &dto.schema.to_string().add(".").add(&dto.table),
+                       con = either!(dto.predicate.is_empty() => ""; &*predicate),
+                       offset = sum,
+                       limit = threads * 3 * BATCH_SIZE);
+    while sum < count.len() {
+        let rows = client.query(&idsq, &[]).await.unwrap();
+        sum = sum + rows.len();
+        for i in 0..threads {
+            let min: i64 = (i * threshold) as i64;
+            let max = either!(i == cpus - 1 => rows.len() - 1; (i + 1) * threshold);
+            let mut ids: Vec<i64> = vec![];
             let mut index = 0;
-            ids.insert(index, rows[n as usize].get(0));
-            index = index + 1;
-        });
-        tokio::task::spawn(call_parallel_batch(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), ids, i, cpus, start));
+            for n in min..max as i64 {
+                ids.insert(index, rows[n as usize].get(0));
+                index = index + 1;
+            }
+            let mut map = HashMap::new();
+            map.insert("schema", dto.schema.clone());
+            map.insert("table", dto.table.clone());
+            map.insert("field", dto.field.clone());
+            map.insert("value", dto.value.clone());
+            map.insert("key", key.clone());
+            tokio::task::spawn(call_parallel_batch(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), ids, i, cpus, start, map));
+        }
     }
+
     let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
     client.execute(&end_notice, &[]).await.unwrap();
     Ok(HttpResponse::Ok().json("200"))
 }
 
-async fn call_parallel_batch(client: Object, ids: Vec<i64>, number: usize, total: usize, start: DateTime<Local>){
-    client.execute(&query, &[]).await.unwrap();
+async fn call_parallel_batch(client: Object, ids: Vec<i64>, number: usize, total: usize, start: DateTime<Local>, map: HashMap<&str, String>) {
+    let batches_total = ids.len() / BATCH_SIZE + 1;
+    for i in 0..batches_total {
+        println!("THREAD-{}: Preparing batch#{} / {}.", number, i, batches_total);
+        let min = i * BATCH_SIZE;
+        let max = either!(i * BATCH_SIZE > ids.len() => ids.len() - 1; i * BATCH_SIZE);
+        let ids_to_send = &ids[min..max];
+        let mut ids_as_string = ids_to_send.iter().map(|val| val.to_string() + ",").collect::<String>();
+        ids_as_string = ids_as_string.substring(0, ids_as_string.len() - 2)
+            .parse()
+            .unwrap();
+        let query = batch_in(ids_as_string, &map).await;
+        println!("THREAD-{}: Sending batch#{} / {}", number, i, batches_total);
+        client.query(&query, &[]).await.unwrap();
+        println!("THREAD-{}: Batch#{} / {} sent.", number, i, batches_total);
+    }
     let dur = Local::now().signed_duration_since(start).to_std().unwrap().as_secs();
     println!("Done {num} / {tot}, time elapsed: {time} seconds!", tot = total, num = number, time = dur);
+}
+
+async fn batch_in(ids: String, map: &HashMap<&str, String>) -> String {
+    format!("update {schema}.{table} set {field} = {val}, modify_dttm = now()
+                        WHERE {pkey}::numeric in ({id})",
+            schema = map["schema"],
+            table = map["table"],
+            id = ids,
+            pkey = map["key"],
+            field = map["field"],
+            val = map["value"]
+    )
 }
