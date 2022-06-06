@@ -1,22 +1,24 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::iter::Map;
 use std::ops::{Add, Deref};
+use std::sync::{Arc, Barrier};
+use std::time::Duration as dur;
 use std::time::SystemTime;
-use futures::future::join_all;
-use futures::executor::ThreadPool;
-use actix_web::web::{Json};
-use actix_web::{HttpResponse};
+use std::fs::File;
+use std::io::Write;
+use actix_web::HttpResponse;
 use actix_web::dev::Service;
 use actix_web::error::Error;
+use actix_web::web::Json;
 use chrono::{DateTime, Duration, Local};
 use deadpool_postgres::{Config, ManagerConfig, Object, RecyclingMethod, Runtime};
-use deadpool_postgres::tokio_postgres::{ NoTls};
-use futures::{Future};
-use futures_cpupool::CpuPool;
+use deadpool_postgres::tokio_postgres::NoTls;
+use log::info;
 use substring::Substring;
+use tokio::runtime::{Builder, Handle};
+
 use crate::errors::MyError;
 use crate::models::UpdateDTO;
-
 
 macro_rules! either {
     ($test:expr => $true_expr:expr; $false_expr:expr) => {
@@ -29,7 +31,7 @@ macro_rules! either {
     }
 }
 
-const BATCH_SIZE: usize = 60000;
+const BATCH_SIZE: i64 = 5000;
 pub const APPLICATION_JSON: &str = "application/json";
 
 #[get("/test")]
@@ -83,7 +85,7 @@ pub async fn batches(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
 
 async fn batch(min: i64, max: i64, dto: &UpdateDTO, key: &String) -> String {
     let predicate = "AND ".to_string().add(&dto.predicate);
-    format!("update {schema}.{table} set {field} = '{val}', modify_dttm = now()
+    format!("update {schema}.{table} set {field} = {val}, modify_dttm = now()
                         WHERE {pkey}::numeric between {minid} and {maxid} {constr}",
         schema = &dto.schema,
         table = &dto.table,
@@ -139,8 +141,6 @@ async fn call_parallel(client: Object, query: String) {
     client.execute(&query, &[]).await.unwrap();
     println!("done {time} !!!!", time = Local::now().format("%Y-%m-%d %H:%M:%S"))
 }
-
-
 
 fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, curr: String) -> String {
     let predicate = "AND ".to_string().add(&dto.predicate);
@@ -232,18 +232,18 @@ fn buildMainQuery(dto: &UpdateDTO, pkey: &String, bup: &String, cpus: String, cu
 }
 
 async fn createBackUp(client: &Object, backup: &String, dto: &UpdateDTO, pkey: &String) -> Result<HttpResponse, MyError> {
-
+    let constraint = "WHERE ".to_string().add(&dto.predicate);
     let val: String = backup.to_string().add("_unique_id");
     let table = &dto.schema.to_string().add(".").add(&dto.table);
     let backup = &dto.schema.to_string().add(".").add(backup);
-
     let vacuum = format!("vacuum verbose analyse {tab}", tab = table);
     client.query(&vacuum, &[]).await.unwrap();
     println!("Vacuumed.");
     let drop = format!("DROP TABLE IF EXISTS {}", backup);
     client.query(&drop, &[]).await.unwrap();
     println!("Dropped backup if exist.");
-    let create = format!("create table if not exists {} as (select * from {})", backup, table);
+    let create = format!("create table if not exists {} as (select {}::bigint, {} from {} {con})", backup, pkey, &dto.field, table,
+                         con = either!(dto.predicate.is_empty() => ""; &*constraint));
     client.query(&create, &[]).await.unwrap();
     println!("Created backup.");
     let index = format!("CREATE INDEX {} ON {} (({}::numeric))", val, backup, pkey);
@@ -252,6 +252,67 @@ async fn createBackUp(client: &Object, backup: &String, dto: &UpdateDTO, pkey: &
     Ok(HttpResponse::Ok().json("ok"))
 }
 
+//#[post("/batches-selective")]
+pub async fn batches_selective_uneffective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
+    let cpus = num_cpus::get() / 2;
+    let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
+    let mut cfg = Config::new();
+    cfg.host = Some(dto.host.to_string());
+    cfg.user = Some(dto.usr.to_string());
+    cfg.password = Some(dto.pwd.to_string());
+    cfg.port = Some(5432);
+    cfg.application_name = Some("RUST TUT".to_string());
+    cfg.dbname = Some(dto.db.to_string());
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
+        .await.unwrap();
+    let key: String = rows[0].get(0);
+    println!("Found primary key - {k}", k = key);
+    //createBackUp(&client, &backup, &dto, &key).await.unwrap();
+    println!("pre-works done!");
+    let predicate = &*"WHERE ".to_string().add(&dto.predicate);
+    let pkey_sql = format!("select {pkey}::bigint from {schema}.{tab} {con} order by {pkey}::bigint",
+                           tab = &dto.table,
+                           pkey = &key,
+                           schema = &dto.schema,
+                           con = either!(dto.predicate.is_empty() => ""; predicate));
+    let ids = client.query(&pkey_sql, &[]).await.unwrap();
+    println!("Found {} records!", ids.len());
+    let start = Local::now();
+    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = start.format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&start_notice, &[]).await.unwrap();
+    let threshold = ids.len() / cpus;
+    println!("Splitting rows between threads...");
+    for i in 0..cpus {
+        let min: i64 = (i * threshold) as i64;
+        let max: i64 = either!((i + 1) * threshold > ids.len() => ids.len(); (i + 1) * threshold) as i64;
+        let mut local: Vec<i64> = vec![];
+        for j in min..max {
+            let val: i64 = ids[j as usize].get(0);
+            local.push(val);
+        }
+        let mut map = HashMap::new();
+        map.insert("schema", dto.schema.clone());
+        map.insert("table", dto.table.clone());
+        map.insert("field", dto.field.clone());
+        map.insert("value", dto.value.clone());
+        map.insert("key", key.clone());
+        map.insert("total", cpus.clone().to_string());
+        map.insert("number", (i + 1).to_string());
+        map.insert("predicate", dto.predicate.clone());
+        let client = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap();
+        println!("\tSending {} / {} done.", i + 1, cpus);
+        //thread_pool.handle().spawn_blocking(move || {call_parallel_batch(client, ids, task_num,i, cpus, map)});
+        tokio::task::spawn(call_parallel_batch(client,  local,map));
+    }
+    println!("Total time elapsed: {} seconds.", Local::now().signed_duration_since(start).to_std().unwrap().as_secs());
+    let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&end_notice, &[]).await.unwrap();
+    Ok(HttpResponse::Ok().json("Sent to DB successfully!"))
+}
 
 #[post("/batches-selective")]
 pub async fn batches_selective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
@@ -273,75 +334,91 @@ pub async fn batches_selective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyE
     let key: String = rows[0].get(0);
     println!("Found primary key - {k}", k = key);
     createBackUp(&client, &backup, &dto, &key).await.unwrap();
-    println!("pre-works done!");
-    let predicate = "where ".to_string().add(&dto.predicate);
-    let count_query = format!("select COUNT(*)::bigint from {tab} {con}",
-                       tab = &dto.schema.to_string().add(".").add(&dto.table),
-                       con = either!(dto.predicate.is_empty() => ""; &*predicate));
-    let count = client.query(&count_query, &[]).await.unwrap();
-    println!("Found {k} rows!", k = count.len());
+    println!("Pre-update works done!");
+    println!("Gathering needed IDs...");
+    let pkey_sql = format!("select {pkey} from {schema}.{tab} order by {pkey}",
+                           tab = backup,
+                           pkey = &key,
+                           schema = &dto.schema);
+    let ids = client.query(&pkey_sql, &[]).await.unwrap();
+    println!("Found {} records!", ids.len());
     let start = Local::now();
     let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = start.format("%Y-%m-%d %H:%M:%S"));
     client.execute(&start_notice, &[]).await.unwrap();
-    let threshold = rows.len() / cpus;
-    let threads = either!(rows.len() / BATCH_SIZE > cpus => cpus; rows.len() / BATCH_SIZE + 1);
-    let mut sum = 0;
-    let idsq = format!("select {akey}::bigint from {tab} {con} order by {akey}::bigint offset {offset} limit {limit}",
-                       akey = key,
-                       tab = &dto.schema.to_string().add(".").add(&dto.table),
-                       con = either!(dto.predicate.is_empty() => ""; &*predicate),
-                       offset = sum,
-                       limit = threads * 3 * BATCH_SIZE);
-    while sum < count.len() {
-        let rows = client.query(&idsq, &[]).await.unwrap();
-        sum = sum + rows.len();
-        for i in 0..threads {
-            let min: i64 = (i * threshold) as i64;
-            let max = either!(i == cpus - 1 => rows.len() - 1; (i + 1) * threshold);
-            let mut ids: Vec<i64> = vec![];
-            let mut index = 0;
-            for n in min..max as i64 {
-                ids.insert(index, rows[n as usize].get(0));
-                index = index + 1;
-            }
-            let mut map = HashMap::new();
-            map.insert("schema", dto.schema.clone());
-            map.insert("table", dto.table.clone());
-            map.insert("field", dto.field.clone());
-            map.insert("value", dto.value.clone());
-            map.insert("key", key.clone());
-            tokio::task::spawn(call_parallel_batch(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), ids, i, cpus, start, map));
+    let threshold = (ids.len() / cpus) + 1;
+    println!("Splitting rows between threads...");
+    for i in 0..cpus {
+        let min: i64 = (i * threshold) as i64;
+        let max: i64 = either!((i + 1) * threshold > ids.len() => ids.len(); (i + 1) * threshold) as i64;
+        let mut local: Vec<i64> = vec![];
+        for j in min..max {
+            let val: i64 = ids[j as usize].get(0);
+            local.push(val);
         }
+        let mut map = HashMap::new();
+        map.insert("schema", dto.schema.clone());
+        map.insert("table", dto.table.clone());
+        map.insert("field", dto.field.clone());
+        map.insert("value", dto.value.clone());
+        map.insert("key", key.clone());
+        map.insert("total", cpus.clone().to_string());
+        map.insert("number", (i + 1).to_string());
+        map.insert("predicate", dto.predicate.clone());
+        let client = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap();
+        println!("\tSending {} / {} done.", i + 1, cpus);
+        tokio::task::spawn(call_parallel_batch(client,local, map));
     }
-
+    println!("Total time elapsed: {} seconds.", Local::now().signed_duration_since(start).to_std().unwrap().as_secs());
     let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
     client.execute(&end_notice, &[]).await.unwrap();
-    Ok(HttpResponse::Ok().json("200"))
+    Ok(HttpResponse::Ok().json("Sent to DB successfully!"))
 }
 
-async fn call_parallel_batch(client: Object, ids: Vec<i64>, number: usize, total: usize, start: DateTime<Local>, map: HashMap<&str, String>) {
-    let batches_total = ids.len() / BATCH_SIZE + 1;
-    for i in 0..batches_total {
-        println!("THREAD-{}: Preparing batch#{} / {}.", number, i, batches_total);
+async fn call_parallel_batch(client: Object, ids: Vec<i64>, map: HashMap<&str, String>) {
+    let local_total = ids.len() as i64;
+    let start = Local::now();
+    let times = (local_total / BATCH_SIZE) + 1;
+    let filename = format!("U:\\logs\\task-{}.log", map["number"]);
+    let mut w = File::create(&filename).unwrap();
+    for i in 0..times {
+        println!("\t\tTask#{}: Preparing batch {} / {}.", map["number"], i + 1, times);
+        let mut local_ids: Vec<i64> = vec![];
         let min = i * BATCH_SIZE;
-        let max = either!(i * BATCH_SIZE > ids.len() => ids.len() - 1; i * BATCH_SIZE);
-        let ids_to_send = &ids[min..max];
-        let mut ids_as_string = ids_to_send.iter().map(|val| val.to_string() + ",").collect::<String>();
-        ids_as_string = ids_as_string.substring(0, ids_as_string.len() - 2)
+        let temp = ((i + 1) * BATCH_SIZE) as i64;
+        let max = either!(temp > local_total => local_total; temp);
+        for j in min..max {
+            let val: i64 = ids[j as usize];
+            local_ids.push(val);
+        }
+        let ids_as_string = "(".to_string().add(&local_ids.iter().map(|val| val.to_string() + "), (").collect::<String>());
+        let str_id = ids_as_string.substring(0, ids_as_string.len() - 3)
             .parse()
             .unwrap();
-        let query = batch_in(ids_as_string, &map).await;
-        println!("THREAD-{}: Sending batch#{} / {}", number, i, batches_total);
+        /*let query = format!("update {schema}.{table} set {field} = {val}, modify_dttm = now()
+                        WHERE {pkey}::numeric between {minid} and {maxid} {constr}",
+                            schema = map["schema"],
+                            table = map["table"],
+                            minid = min,
+                            maxid = max,
+                            pkey = map["key"],
+                            constr = either!(map["predicate"].is_empty() => ""; &*map["predicate"]),
+                            field = map["field"],
+                            val = map["value"]
+        );*/
+        let query = batch_in(str_id, &map).await;
+        writeln!(&mut w, "{}", query).unwrap();
+        println!("\t\tTask#{}: Sending batch {} / {}.", map["number"], i + 1, times);
         client.query(&query, &[]).await.unwrap();
-        println!("THREAD-{}: Batch#{} / {} sent.", number, i, batches_total);
+        println!("\t\tTask#{}: Batches sent {} / {}.", map["number"], i + 1, times);
     }
     let dur = Local::now().signed_duration_since(start).to_std().unwrap().as_secs();
-    println!("Done {num} / {tot}, time elapsed: {time} seconds!", tot = total, num = number, time = dur);
+    println!("\t\tTask#{num} - Done {num} / {tot}, time elapsed: {time} seconds!", tot = map["total"], num = map["number"], time = dur);
+
 }
 
 async fn batch_in(ids: String, map: &HashMap<&str, String>) -> String {
     format!("update {schema}.{table} set {field} = {val}, modify_dttm = now()
-                        WHERE {pkey}::numeric in ({id})",
+                        WHERE {pkey}::numeric = ANY(VALUES {id})",
             schema = map["schema"],
             table = map["table"],
             id = ids,
@@ -350,3 +427,5 @@ async fn batch_in(ids: String, map: &HashMap<&str, String>) -> String {
             val = map["value"]
     )
 }
+
+
