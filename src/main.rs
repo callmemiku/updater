@@ -19,6 +19,7 @@ async fn main() -> io::Result<()> {
             .service(update::test)
             .service(update::batches)
             .service(update::batches_selective)
+            .service(update::update_from_view)
     })
         .bind("0.0.0.0:9090")?
         .run()
