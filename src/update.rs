@@ -1,21 +1,12 @@
 use std::collections::HashMap;
-use std::iter::Map;
-use std::ops::{Add, Deref};
-use std::sync::{Arc, Barrier};
-use std::time::Duration as dur;
-use std::time::SystemTime;
-use std::fs::File;
-use std::io::Write;
+use std::ops::Add;
 use actix_web::HttpResponse;
-use actix_web::dev::Service;
 use actix_web::error::Error;
-use actix_web::web::{Buf, Json};
-use chrono::{DateTime, Duration, Local};
+use actix_web::web::{Json};
+use chrono::{Local};
 use deadpool_postgres::{Config, ManagerConfig, Object, RecyclingMethod, Runtime};
 use deadpool_postgres::tokio_postgres::NoTls;
-use log::info;
 use substring::Substring;
-use tokio::runtime::{Builder, Handle};
 
 use crate::errors::MyError;
 use crate::models::{UpdateDTO, UpdateFromViewDTO};
@@ -32,7 +23,6 @@ macro_rules! either {
 }
 
 const BATCH_SIZE: i64 = 5000;
-pub const APPLICATION_JSON: &str = "application/json";
 
 #[get("/test")]
 pub async fn test() -> Result<HttpResponse, Error> {
@@ -129,7 +119,6 @@ pub async fn service(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     for i in 1..cpus + 1 {
         let query = buildMainQuery(&dto, &key, &backup, cpus.to_string(), i.to_string());
         tokio::task::spawn(call_parallel(cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap(), query));
-        //call(&client, &query).await.unwrap();
     }
     Ok(HttpResponse::Ok().json("200"))
 }
@@ -278,6 +267,7 @@ async fn createBackUp(client: &Object, backup: &String, dto: HashMap<&str, Strin
     Ok(HttpResponse::Ok().json("ok"))
 }
 
+#[deprecated(since="1.5.0", note="please use `batches_selective` instead")]
 //#[post("/batches-selective")]
 pub async fn batches_selective_uneffective(dto: Json<UpdateDTO>) -> Result<HttpResponse, MyError> {
     let cpus = num_cpus::get() / 2;
@@ -405,8 +395,6 @@ async fn call_parallel_batch(client: Object, ids: Vec<i64>, map: HashMap<&str, S
     let local_total = ids.len() as i64;
     let start = Local::now();
     let times = (local_total / BATCH_SIZE) + 1;
-    //let filename = format!("U:\\logs\\task-{}.log", map["number"]);
-    //let mut w = File::create(&filename).unwrap();
     for i in 0..times {
         println!("\t\tTask#{}: Preparing batch {} / {}.", map["number"], i + 1, times);
         let mut local_ids: Vec<i64> = vec![];
@@ -421,19 +409,7 @@ async fn call_parallel_batch(client: Object, ids: Vec<i64>, map: HashMap<&str, S
         let str_id = ids_as_string.substring(0, ids_as_string.len() - 3)
             .parse()
             .unwrap();
-        /*let query = format!("update {schema}.{table} set {field} = {val}, modify_dttm = now()
-                        WHERE {pkey}::numeric between {minid} and {maxid} {constr}",
-                            schema = map["schema"],
-                            table = map["table"],
-                            minid = min,
-                            maxid = max,
-                            pkey = map["key"],
-                            constr = either!(map["predicate"].is_empty() => ""; &*map["predicate"]),
-                            field = map["field"],
-                            val = map["value"]
-        );*/
         let query = batch_in(str_id, &map).await;
-        //writeln!(&mut w, "{}", query).unwrap();
         println!("\t\tTask#{}: Sending batch {} / {}.", map["number"], i + 1, times);
         client.query(&query, &[]).await.unwrap();
         println!("\t\tTask#{}: Batches sent {} / {}.", map["number"], i + 1, times);
@@ -475,7 +451,7 @@ pub async fn update_from_view(dto: Json<UpdateFromViewDTO>) -> Result<HttpRespon
     let key: String = rows[0].get(0);
     println!("Found primary key - {k}", k = key);
     let map = vdto_to_map(&dto).await;
-    //createBackUp(&client, &backup, map, &key).await.unwrap();
+    createBackUp(&client, &backup, map, &key).await.unwrap();
     for i in 0..cpus {
         let query = update_view_query(&dto, i, cpus, &key).await;
         println!("{}", query);
@@ -540,7 +516,7 @@ async fn update_view_query(dto: &UpdateFromViewDTO, curr: usize, total: usize, k
                 PERFORM dblink_exec(query ||
                                         ' AND n.{pkey} % ' || {cpus} || ' = (' || {cpu} || ' - 1)
                                           AND t.object_record_id = n.{pkey} AND t.object_record_id BETWEEN ' ||
-                                    rec_start.object_record_id || ' AND ' || rec_stop.object_record_id || 'and t.person_idfl_new <> null'
+                                    rec_start.object_record_id || ' AND ' || rec_stop.object_record_id || ' and t.person_idfl_new <> null'
                     );
 
                 query_time_elapsed := round(extract('epoch' from clock_timestamp() - query_time_start)::numeric, 2);
@@ -581,5 +557,123 @@ $do$ language plpgsql",
         usr = &dto.usr,
         pw = &dto.pwd,
         pkey = key,
+    )
+}
+
+#[post("/view-batches")]
+pub async fn view_batches(dto: Json<UpdateFromViewDTO>) -> Result<HttpResponse, MyError> {
+    let mut cpus = num_cpus::get() / 2;
+    let backup: String = format!("back_up_table_{}_rust_app_do_not_touch", &dto.table).to_string();
+    let iter_table = format!("iter_table_for_{}_do_not_touch", &dto.view);
+    let mut cfg = Config::new();
+    cfg.host = Some(dto.host.to_string());
+    cfg.user = Some(dto.usr.to_string());
+    cfg.password = Some(dto.pwd.to_string());
+    cfg.port = Some(5432);
+    cfg.application_name = Some("RUST TUT".to_string());
+    cfg.dbname = Some(dto.db.to_string());
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query("select column_name from information_schema.columns where table_name = $1 and is_nullable = 'NO'", &[&dto.table])
+        .await.unwrap();
+    let key: String = rows[0].get(0);
+    println!("Found primary key - {k}", k = key);
+    let map = vdto_to_map(&dto).await;
+    println!("Preparing back-up...");
+    //createBackUp(&client, &backup, map, &key).await.unwrap();
+    println!("Preparing iter-table...");
+    client.query(&format!("drop table if exists {}.{}", &dto.schema, iter_table), &[]).await.unwrap();
+    let iter_q = format!("create table {schema}.{iter} as (select object_record_id::numeric as {k}, {f} from {schema}.{view})", schema = &dto.schema, iter = iter_table, k = key, f = &dto.view_field, view = &dto.view);
+    client.query(&iter_q, &[]).await.unwrap();
+    client.query(&format!("CREATE INDEX {} ON {}.{} (({}::numeric))", "index_iterate".to_string().add(&*iter_table), &dto.schema, iter_table, key), &[]).await.unwrap();
+    println!("Iter-table created!");
+    println!("Pre-update works done!");
+    println!("Gathering needed IDs...");
+    let pkey_sql = format!("select {pkey}::bigint from {schema}.{tab} order by {pkey}",
+                           tab = iter_table,
+                           pkey = &key,
+                           schema = &dto.schema);
+    let ids = client.query(&pkey_sql, &[]).await.unwrap();
+    println!("Found {} records!", ids.len());
+    let start = Local::now();
+    let start_notice = format!("select * from {schema}.{table} limit 1. --start: {time}", schema = &dto.schema, table = &dto.table, time = start.format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&start_notice, &[]).await.unwrap();
+    let threshold = either!((ids.len() / cpus) + 1 < (BATCH_SIZE as usize)  => ids.len(); (ids.len() / cpus) + 1);
+    println!("Splitting rows between threads...");
+    cpus = either!(threshold == ids.len() => 1; num_cpus::get() / 2);
+    for i in 0..cpus {
+        let min: i64 = (i * threshold) as i64;
+        let max: i64 = either!((i + 1) * threshold > ids.len() => ids.len(); (i + 1) * threshold) as i64;
+        let mut local: Vec<i64> = vec![];
+        for j in min..max {
+            let val: i64 = ids[j as usize].get(0);
+            local.push(val);
+        }
+        let mut map = HashMap::new();
+        map.insert("schema", dto.schema.clone());
+        map.insert("table", dto.table.clone());
+        map.insert("field", dto.field.clone());
+        map.insert("key", key.clone());
+        map.insert("total", cpus.clone().to_string());
+        map.insert("number", (i + 1).to_string());
+        map.insert("view", dto.view.clone());
+        map.insert("iter_table", iter_table.clone());
+        map.insert("view_field", dto.view_field.clone());
+        let client = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap().get().await.unwrap();
+        println!("\tSending {} / {} done.", i + 1, cpus);
+        tokio::task::spawn(call_parallel_batch_view(client,local, map));
+    }
+    println!("Total time elapsed: {} seconds.", Local::now().signed_duration_since(start).to_std().unwrap().as_secs());
+    let end_notice = format!("select * from {schema}.{table} limit 1. --end: {time}", schema = &dto.schema, table = &dto.table, time = Local::now().format("%Y-%m-%d %H:%M:%S"));
+    client.execute(&end_notice, &[]).await.unwrap();
+    //let iter_q = format!("drop table {}.{}", &dto.schema, iter_table);
+    //client.query(&iter_q, &[]).await.unwrap();
+    Ok(HttpResponse::Ok().json("Sent to DB successfully!"))
+}
+
+async fn call_parallel_batch_view(client: Object, ids: Vec<i64>, map: HashMap<&str, String>) {
+    let local_total = ids.len() as i64;
+    let start = Local::now();
+    let times = (local_total / BATCH_SIZE) + 1;
+    for i in 0..times {
+        println!("\t\tTask#{}: Preparing batch {} / {}.", map["number"], i + 1, times);
+        let mut local_ids: Vec<i64> = vec![];
+        let min = i * BATCH_SIZE;
+        let temp = ((i + 1) * BATCH_SIZE) as i64;
+        let max = either!(temp > local_total => local_total; temp);
+        for j in min..max {
+            let val: i64 = ids[j as usize];
+            local_ids.push(val);
+        }
+        let ids_as_string = "(".to_string().add(&local_ids.iter().map(|val| val.to_string() + "), (").collect::<String>());
+        let str_id = ids_as_string.substring(0, ids_as_string.len() - 3)
+            .parse()
+            .unwrap();
+        let query = batch_view(str_id, &map).await;
+
+        println!("{}", query);
+
+        println!("\t\tTask#{}: Sending batch {} / {}.", map["number"], i + 1, times);
+        client.query(&query, &[]).await.unwrap();
+        println!("\t\tTask#{}: Batches sent {} / {}.", map["number"], i + 1, times);
+    }
+    let dur = Local::now().signed_duration_since(start).to_std().unwrap().as_secs();
+    println!("\t\tTask#{num} - Done {num} / {tot}, time elapsed: {time} seconds!", tot = map["total"], num = map["number"], time = dur);
+
+}
+
+async fn batch_view(ids: String, map: &HashMap<&str, String>) -> String {
+    format!("update {schema}.{table} set {field} = {schema}.{iter}.{view_field}, modify_dttm = now() from {schema}.{iter}
+                        WHERE {schema}.{iter}.{pkey} = ANY(VALUES {id})
+                        and {schema}.{table}.{pkey} = {schema}.{iter}.{pkey}",
+            schema = map["schema"],
+            table = map["table"],
+            id = ids,
+            pkey = map["key"],
+            field = map["field"],
+            iter = map["iter_table"],
+            view_field = map["view_field"]
     )
 }

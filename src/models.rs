@@ -30,4 +30,5 @@ pub struct UpdateFromViewDTO {
     pub port: String,
     pub usr: String,
     pub pwd: String,
+    pub view_field: String,
 }
